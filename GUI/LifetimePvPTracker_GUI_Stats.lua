@@ -234,8 +234,10 @@ local function WL_Duels(profile)
     local me = UnitName("player") or ""
     local w, l = 0, 0
     local rec = {} -- opp -> {w,l}
-    for _, d in ipairs(profile.duels or {}) do
+    for a, d in ipairs(profile.duels or {}) do
         local opp
+    
+        DBG("Winner: %s", d.winner)
         if d.winner and string.sub(d.winner, 1, #me) == me then
             w = w + 1
             opp = d.loser
@@ -243,7 +245,7 @@ local function WL_Duels(profile)
                 rec[opp] = rec[opp] or { w = 0, l = 0 }
                 rec[opp].w = rec[opp].w + 1
             end
-        elseif d.loser and string.sub(d.loser, 1, #me) == me then
+        else
             l = l + 1
             opp = d.winner
             if opp then
@@ -262,6 +264,8 @@ local function WL_Duels(profile)
         if s.w > rivalW then rival, rivalW, rivalL = opp, s.w, s.l end
         if s.l > nemL then nem, nemL, nemW = opp, s.l, s.w end
     end
+
+    -- DBG("LOG: %d %d %d %s %d %d %d %s %d %d", w, l, pct(w, l), nem, nemW, nemL, rival, rivalW, rivalL)
 
     return w, l, pct(w, l), nem, nemW, nemL, rival, rivalW, rivalL
 end
@@ -478,7 +482,7 @@ function UI_RenderHome()
 
     if nem then
         SetKV(UI.homeDuels, 3, 
-            WHITE .. "Nemesis:" .. RESET,
+            WHITE .. "Nemesis:" .. nem .. RESET,
             nem .. GRAY .. " (" .. nemW .. "-" .. nemL .. ")" .. RESET)
 
     else
@@ -490,7 +494,7 @@ function UI_RenderHome()
 
     if riv then
         SetKV(UI.homeDuels, 4, 
-            WHITE .. "Rival:" .. RESET,
+            WHITE .. "Rival:" .. riv .. RESET,
             riv .. GRAY .. " (" .. rivW .. "-" .. rivL .. ")" .. RESET
         )
     else

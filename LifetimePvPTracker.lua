@@ -12,7 +12,7 @@ local function _Settings()
     return LifetimePvPTrackerDB.settings
 end
 
-local function DBG(fmt, ...)
+function DBG(fmt, ...)
     if not (_Settings().debug) then return end
     local msg = string.format(fmt, ...)
     DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99LPvP|r " .. msg)

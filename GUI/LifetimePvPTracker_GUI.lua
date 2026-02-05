@@ -267,6 +267,10 @@ end
 
 function UI:Refresh()
     ApplyUISettings()
+
+    -- FIX: Home tab hides scroll; re-show it for other tabs
+    if self.scroll then self.scroll:Show() end
+
     self:ClearAllTabRows()
     self:UpdateTabHighlights()
 
