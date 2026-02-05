@@ -1,10 +1,11 @@
 ## Interface: 20505
 ## Title: |cffeda55fLifetime PvP Tracker |r
 ## Author: .shadez.
-## Version: 0.8
+## Version: 0.8.1
 ## SavedVariables: LifetimePvPTrackerDB
-## IconTexture: Interface\Icons\achievement_arena_2v2_7
-## Notes: Tracks lifetime PvP activity across Battlegrounds, World PvP, Arenas, and Duels.|n|n|cffbbbbbbAuthor Discord: .shadez.|r|n|n|cffff3333Version: 0.8 (Development)|n|n|cff33ff33DB Version: 1.0 (Live)
+## IconTexture: Interface\AddOns\LifetimePvPTracker\assets\lpvp_icon.tga
+
+## Notes: Tracks lifetime PvP activity across Battlegrounds, World PvP, Arenas, and Duels.|n|n|cffbbbbbbAuthor Discord: .shadez.|r|n|n|cffff3333Version: 0.8.1 (Development)|n|n|cff33ff33DB Version: 1.0 (Live)
 
 ## Core Files
 LifetimePvPTracker_DB.lua
