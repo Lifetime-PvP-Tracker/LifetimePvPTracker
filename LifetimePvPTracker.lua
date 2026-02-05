@@ -61,6 +61,18 @@ function LifetimePvPTracker_GetCharKey()
     return name .. "-" .. realm
 end
 
+-- Ensure fields exist even for older SavedVariables
+local function EnsureProfileDefaults(p)
+    if not p then return end
+    p.nextID = p.nextID or 1
+    p.battlegrounds = p.battlegrounds or {}
+    p.arenas = p.arenas or {}
+    p.worldPvP = p.worldPvP or {}
+    p.duels = p.duels or {}
+    p.opponents = p.opponents or {} -- for nemesis/rival later
+    if p.activeMatch == nil then p.activeMatch = nil end
+end
+
 function LifetimePvPTracker_InitDB()
     LifetimePvPTrackerDB.version = DB_VERSION
     LifetimePvPTrackerDB.settings = LifetimePvPTrackerDB.settings or { uiScale = 1.0, uiAlpha = 1.0, debug = false }
@@ -74,14 +86,21 @@ function LifetimePvPTracker_InitDB()
             arenas = {},
             worldPvP = {},
             duels = {},
+            opponents = {},
             activeMatch = nil,
         }
     end
+
+    -- IMPORTANT: also backfill defaults for existing profiles
+    EnsureProfileDefaults(LifetimePvPTrackerDB.profiles[key])
 end
 
 function LifetimePvPTracker_GetProfile()
     LifetimePvPTracker_InitDB()
-    return LifetimePvPTrackerDB.profiles[LifetimePvPTracker_GetCharKey()]
+    local p = LifetimePvPTrackerDB.profiles[LifetimePvPTracker_GetCharKey()]
+    -- Extra safety (in case callers access before init on some clients)
+    EnsureProfileDefaults(p)
+    return p
 end
 
 local function NextID(p)
@@ -119,8 +138,6 @@ end
 
 local function IsWorldContext()
     local _, t = IsInInstance()
-    -- In TBC clients, outdoor world is often "none".
-    -- If your anniversary client returns "world", allow that too.
     return (t == "none" or t == "world")
 end
 
@@ -363,7 +380,7 @@ local function IsPlayerFlag(flags)
     return band(flags, COMBATLOG_OBJECT_TYPE_PLAYER) > 0
 end
 
--- Cache player info when we CAN see it (target/mouseover). World kills often don't let you query level/class later.
+-- Cache player info when we CAN see it (target/mouseover).
 local seenPlayers = {}
 
 local function CacheUnit(unit)
@@ -390,13 +407,11 @@ local function CacheUnit(unit)
         ts = time(),
     }
 
-    -- Key by base name and by full name (if we have realm).
     seenPlayers[name] = info
     seenPlayers[full] = info
 end
 
 local function GetPlayerCoords()
-    -- Preferred modern API.
     if C_Map and C_Map.GetBestMapForUnit and C_Map.GetPlayerMapPosition then
         local mapID = C_Map.GetBestMapForUnit("player")
         if mapID then
@@ -410,7 +425,6 @@ local function GetPlayerCoords()
         end
     end
 
-    -- Fallback (older API).
     if SetMapToCurrentZone and GetPlayerMapPosition then
         SetMapToCurrentZone()
         local x, y = GetPlayerMapPosition("player")
@@ -437,7 +451,6 @@ local function AttachCachedInfo(e, playerName)
         e.class = e.class or info.class
         e.race  = e.race  or info.race
 
-        -- If we learned a realm'd name later, keep the nicer full string for display.
         if info.full and info.full ~= "" then
             if e.victim and e.result == "you_killed" then e.victim = info.full end
             if e.killer and e.result == "killed_you" then e.killer = info.full end
@@ -461,13 +474,11 @@ local function LogWorldPvPKill(victimName, victimGUID)
         result = "you_killed",
         victim = victimName or "Unknown",
         victimGUID = victimGUID,
-        honor = 0, -- filled by chat association
-        -- level/class/race filled from cache if possible
+        honor = 0,
     }
 
     AttachCachedInfo(e, victimName)
 
-    -- Sometimes the honor message lands right before/after the kill event; attach if extremely recent.
     if lastHonorAmount and lastHonorTime and (time() - lastHonorTime) <= 2 then
         e.honor = (e.honor or 0) + (tonumber(lastHonorAmount) or 0)
     end
@@ -493,7 +504,6 @@ local function LogWorldPvPDeath(killerName, killerGUID)
         result = "killed_you",
         killer = killerName or "Unknown",
         killerGUID = killerGUID,
-        -- level/class/race filled from cache if possible
     }
 
     AttachCachedInfo(e, killerName)
@@ -527,17 +537,180 @@ local function HandleCombatLog()
 
     local meGUID = UnitGUID("player")
 
-    -- You killed a player in the world.
     if srcGUID == meGUID and IsPlayerFlag(dstFlags) then
         LogWorldPvPKill(dstName, dstGUID)
         return
     end
 
-    -- A player killed you in the world.
     if dstGUID == meGUID and IsPlayerFlag(srcFlags) then
         LogWorldPvPDeath(srcName, srcGUID)
         return
     end
+end
+
+-- =========================================================
+-- Duel Tracking (SAFE: only logs YOUR duels)
+-- =========================================================
+
+local function _EscapePattern(s)
+    return (s:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1"))
+end
+
+local function _BuildDuelPattern(globalString)
+    if not globalString or globalString == "" then return nil end
+    local p = _EscapePattern(globalString)
+    p = p:gsub("%%s", "(.+)")
+    return "^" .. p .. "$"
+end
+
+-- Build a small list of acceptable duel winner patterns (varies by client / punctuation / localization)
+local _DUEL_PATTERNS = {}
+
+do
+    local p1 = _BuildDuelPattern(_G.DUEL_WINNER_KNOCKOUT)
+    if p1 then table.insert(_DUEL_PATTERNS, p1) end
+
+    local p2 = _BuildDuelPattern(_G.DUEL_WINNER) -- some clients use DUEL_WINNER
+    if p2 then table.insert(_DUEL_PATTERNS, p2) end
+
+    -- Safe English fallback with OPTIONAL period at end
+    table.insert(_DUEL_PATTERNS, "^(.+) has defeated (.+) in a duel%.?$")
+end
+
+local function _StripColorCodes(s)
+    if not s then return s end
+    -- Remove WoW color codes and reset codes
+    s = s:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
+    return s
+end
+
+local function _MatchAnyDuelPattern(msg)
+    if not msg then return nil end
+    msg = _StripColorCodes(msg)
+
+    for _, pat in ipairs(_DUEL_PATTERNS) do
+        local w, l = msg:match(pat)
+        if w and l then return w, l end
+    end
+    return nil, nil
+end
+
+local function _BaseName(full)
+    if not full then return nil end
+    return full:match("^([^%-]+)") or full
+end
+
+local function _FullNameFromUnit(unit)
+    if not UnitExists(unit) or not UnitIsPlayer(unit) or UnitIsUnit(unit, "player") then return nil end
+    local n, r = UnitName(unit)
+    if not n or n == "" then return nil end
+    if r and r ~= "" then return n .. "-" .. r end
+    return n
+end
+
+local function _GetPlayerCoords()
+    if C_Map and C_Map.GetBestMapForUnit and C_Map.GetPlayerMapPosition then
+        local mapID = C_Map.GetBestMapForUnit("player")
+        if mapID then
+            local pos = C_Map.GetPlayerMapPosition(mapID, "player")
+            if pos then
+                local x, y = pos:GetXY()
+                return mapID, x, y
+            end
+        end
+    end
+    if SetMapToCurrentZone and GetPlayerMapPosition then
+        SetMapToCurrentZone()
+        local x, y = GetPlayerMapPosition("player")
+        return nil, x, y
+    end
+    return nil, nil, nil
+end
+
+local function _EnsureOpponentRecord(profile, oppName)
+    profile.opponents = profile.opponents or {}
+    local rec = profile.opponents[oppName]
+    if not rec then
+        rec = { name = oppName, wins = 0, losses = 0, total = 0 }
+        profile.opponents[oppName] = rec
+    end
+    return rec
+end
+
+local function _AttachDuelCachedInfo(d, opponentName)
+    if not d or not opponentName then return end
+    local base = StripRealm(opponentName)
+    local info = seenPlayers[opponentName] or (base and seenPlayers[base]) or nil
+    if info then
+        d.opponentLevel = d.opponentLevel or info.level
+        d.opponentRace  = d.opponentRace  or info.race
+        d.opponentClass = d.opponentClass or info.class
+        if info.full and info.full ~= "" then
+            d.opponent = info.full
+        end
+    end
+end
+
+local function _StartDuel(profile)
+    local mapID, x, y = _GetPlayerCoords()
+    local oppGuess = _FullNameFromUnit("target") or _FullNameFromUnit("mouseover") or "Unknown"
+
+    profile._activeDuel = {
+        startTime = time(),
+        zone = GetRealZoneText() or GetZoneText() or "Unknown",
+        mapID = mapID,
+        x = x, y = y,
+        opponent = oppGuess,
+        winner = nil,
+        confirmed = false,
+        opponentLevel = nil,
+        opponentRace = nil,
+        opponentClass = nil,
+    }
+
+    DBG("Duel Started - ", oppGuess)
+
+    if oppGuess and oppGuess ~= "Unknown" then
+        _AttachDuelCachedInfo(profile._activeDuel, oppGuess)
+    end
+end
+
+local function _CommitDuel(profile)
+    local d = profile._activeDuel
+    if not d or not d.confirmed then
+        profile._activeDuel = nil
+        return
+    end
+
+    d.endTime = time()
+    d.duration = (d.endTime - (d.startTime or d.endTime))
+
+    profile.duels = profile.duels or {}
+    table.insert(profile.duels, d)
+
+    local opp = d.opponent or "Unknown"
+    local rec = _EnsureOpponentRecord(profile, opp)
+
+    rec.total = (rec.total or 0) + 1
+    rec.lastTime = d.endTime
+    rec.lastZone = d.zone
+    rec.lastMapID = d.mapID
+    rec.lastX = d.x
+    rec.lastY = d.y
+
+    if d.winner == "player" then
+        rec.wins = (rec.wins or 0) + 1
+    else
+        rec.losses = (rec.losses or 0) + 1
+    end
+
+    if d.opponentLevel then rec.level = d.opponentLevel end
+    if d.opponentRace then rec.race = d.opponentRace end
+    if d.opponentClass then rec.class = d.opponentClass end
+
+    DBG("Duel Committed - ", opp)
+
+    profile._activeDuel = nil
 end
 
 -- =========================================================
@@ -556,7 +729,6 @@ f:RegisterEvent("UPDATE_MOUSEOVER_UNIT")
 f:RegisterEvent("DUEL_REQUESTED")
 f:RegisterEvent("DUEL_FINISHED")
 f:RegisterEvent("CHAT_MSG_SYSTEM")
-f:RegisterEvent("WHO_LIST_UPDATE")
 
 f:SetScript("OnEvent", function(_, event, arg1)
     if event == "PLAYER_LOGIN" then
@@ -604,16 +776,12 @@ f:SetScript("OnEvent", function(_, event, arg1)
         lastHonorAmount = amt
         lastHonorTime = time()
 
-        -- BG honor fallback
         local p = LifetimePvPTracker_GetProfile()
         if p and p.activeMatch and IsInBattleground() then
             p.activeMatch.honorFromChat = (p.activeMatch.honorFromChat or 0) + amt
         end
 
-        -- World PvP honor association:
-        -- Attach honor to the most recent world kill if it happened very recently.
         if IsWorldContext() and not IsInBattleground() and not IsInArena() and pendingWorldKillIndex and pendingWorldKillTime then
-            -- Expire stale pending kill.
             if (time() - pendingWorldKillTime) > 25 then
                 pendingWorldKillIndex = nil
                 pendingWorldKillTime = nil
@@ -628,6 +796,66 @@ f:SetScript("OnEvent", function(_, event, arg1)
         end
 
         return
+    end
+
+    -- =========================
+    -- Duel events
+    -- =========================
+    if event == "DUEL_REQUESTED" then
+        DBG("Duel Requested")
+        local p = LifetimePvPTracker_GetProfile and LifetimePvPTracker_GetProfile() or nil
+        if p then
+            _StartDuel(p)
+        end
+        return
+    end
+
+    if event == "DUEL_FINISHED" then
+        DBG("Duel Finished 1")
+        local p = LifetimePvPTracker_GetProfile and LifetimePvPTracker_GetProfile() or nil
+        if p and p._activeDuel and not p._activeDuel.confirmed then
+            p._activeDuel = nil
+        end
+        return
+    end
+
+    if event == "CHAT_MSG_SYSTEM" then
+        DBG("Duel Finished 2")
+        local msg = arg1
+        DBG("ARG", arg1)
+        if msg then
+        DBG("Duel Finished 3")
+            local winnerName, loserName = _MatchAnyDuelPattern(msg)
+            if winnerName and loserName then
+                local me = UnitName("player")
+                local wBase = _BaseName(winnerName)
+                local lBase = _BaseName(loserName)
+
+                if me and (wBase == me or lBase == me) then
+                    local p = LifetimePvPTracker_GetProfile and LifetimePvPTracker_GetProfile() or nil
+                    if p then
+                        if not p._activeDuel then
+                            _StartDuel(p)
+                        end
+
+                        local d = p._activeDuel
+                        d.confirmed = true
+
+                        if wBase == me then
+                            d.winner = me
+                            d.opponent = loserName
+                        else
+                            d.winner = loserName
+                            d.opponent = winnerName
+                        end
+
+                        _AttachDuelCachedInfo(d, d.opponent)
+                        _CommitDuel(p)
+                    end
+                    return
+                end
+            end
+        end
     end
 end)
 
